@@ -8,6 +8,18 @@ check.
 The script stays practical: open a menu, check what is missing, choose what to
 install, and keep control of the process.
 
+## Screenshots
+
+![Main menu](screenshots/main-menu.png)
+
+![Software scan](screenshots/software-scan.png)
+
+![System information](screenshots/system-information.png)
+
+![Windows 11 actions](screenshots/windows-11-actions.png)
+
+![Goodbye screen](screenshots/goodbye.png)
+
 ## What It Does
 
 - Checks common apps in a live list and lets you choose which ones to install.
