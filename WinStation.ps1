@@ -660,27 +660,6 @@ function Rename-ThisComputer {
     Write-Ui "Computer renamed to $newName. A restart is required." -ForegroundColor Green
 }
 
-function Rename-LocalAccountInteractive {
-    if (-not (Assert-Administrator 'rename a local account')) { return }
-    $localUsers = @(Get-LocalUser | Sort-Object Name)
-    Write-Ui 'Local accounts:' -ForegroundColor Cyan
-    $localUsers | ForEach-Object { Write-Ui "  - $($_.Name)" }
-    Write-Ui
-    Write-Ui 'Step 1 of 2: enter the CURRENT account name to rename.' -ForegroundColor Yellow
-    $oldName = Read-ActionInput "Current account name (signed in as: $((Get-UserContext).Interactive))"
-    if ($null -eq $oldName) { return }
-    if (-not (Get-LocalUser -Name $oldName -ErrorAction SilentlyContinue)) { Write-Ui 'Local account not found.' -ForegroundColor Red; return }
-    Write-Ui
-    Write-Ui "Step 2 of 2: enter the NEW name for '$oldName'." -ForegroundColor Yellow
-    $newName = Read-ActionInput 'New local account name'
-    if ($null -eq $newName) { return }
-    if (-not $newName -or $newName.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) { Write-Ui 'Invalid account name.' -ForegroundColor Red; return }
-    Write-Ui 'Note: this does not rename the existing C:\Users profile folder.' -ForegroundColor Yellow
-    if (-not $PSCmdlet.ShouldProcess($oldName, "Rename local account to $newName")) { return }
-    Rename-LocalUser -Name $oldName -NewName $newName
-    Write-Ui "Local account renamed to $newName. Sign out to apply it everywhere." -ForegroundColor Green
-}
-
 function Join-DomainInteractive {
     if (-not (Assert-Administrator 'join a domain')) { return }
     $domain = Read-ActionInput 'Active Directory domain name (for example corp.example.com)'
@@ -893,15 +872,14 @@ function Show-WindowsActions {
     $menuLines = @(
         @{ Text='[1]  Enable classic full context menu'; Color='White' },
         @{ Text='[2]  Rename this computer'; Color='White' },
-        @{ Text='[3]  Rename a local account'; Color='White' },
-        @{ Text='[4]  Join an Active Directory domain'; Color='White' },
+        @{ Text='[3]  Join an Active Directory domain'; Color='White' },
         @{ Text='[B]  Back to main menu'; Color='DarkGray' }
     )
     do {
         Show-Banner
-        $action = Show-ChoiceMenu -Title 'WINDOWS 11 ACTIONS' -MenuLines $menuLines -ExitKey 'B' -ExitHint 'Esc: back | B: select back' -ShortcutHint '1-4: select a shortcut, then press Enter.' -EscapeToExit
+        $action = Show-ChoiceMenu -Title 'WINDOWS 11 ACTIONS' -MenuLines $menuLines -ExitKey 'B' -ExitHint 'Esc: back | B: select back' -ShortcutHint '1-3: select a shortcut, then press Enter.' -EscapeToExit
         if ($action -eq 'B') { return }
-        if ($action -notin @('1','2','3','4')) {
+        if ($action -notin @('1','2','3')) {
             Write-Ui 'Invalid selection.' -ForegroundColor Yellow
         } else {
             Show-Screen 'WINDOWS 11 ACTIONS'
@@ -911,8 +889,7 @@ function Show-WindowsActions {
                 switch ($action) {
                     '1' { Enable-ClassicContextMenu }
                     '2' { Rename-ThisComputer }
-                    '3' { Rename-LocalAccountInteractive }
-                    '4' { Join-DomainInteractive }
+                    '3' { Join-DomainInteractive }
                 }
             } catch {
                 Write-Ui ("Action failed: " + $_.Exception.Message) -ForegroundColor Red
