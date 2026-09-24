@@ -30,10 +30,42 @@ Selecting a module without PowerShell 7 adds the official PowerShell MSI to the
 plan shown before confirmation. PowerShell runs first. Module failures are
 reported individually if the dependency could not be installed.
 
-Software installation shows the current item and native installer output. Quiet
-installers receive a status message every 15 seconds. The final summary includes
-each result and reported restart requirements. WinStation does not request an
-automatic restart; third-party installers still control their own behavior.
+Software installation shows the current item and native installer output. The
+final summary includes each result and reported restart requirements, and failed
+items can be retried with `R`. WinStation does not request an automatic restart;
+third-party installers still control their own behavior.
+
+## Separate Admin Account
+
+When an employee is signed in without administrator rights and an IT account
+(for example `admmatik`) elevates WinStation, results go to the employee or to
+all users, never only to the admin profile:
+
+- WinGet apps install machine-wide. Apps that only have a per-user installer, or
+  refuse administrator rights, install for the signed-in employee.
+- Microsoft Store apps always install for the signed-in employee.
+- PowerShell modules install for all users (`AllUsers`), so both the employee and
+  the admin account can use them for Azure and Microsoft Graph.
+- The app scan checks what the signed-in employee has installed.
+- The classic context menu is written to the employee's registry.
+
+Per-user installs run through a temporary scheduled task as the signed-in user;
+the task and its files are removed afterwards.
+
+## Preparing A PC For Someone Else
+
+When the administrator is also the signed-in account, WinStation asks who the
+apps are for before installing:
+
+- `[1]` the signed-in account: everything installs, per-user apps for that account.
+- `[2]` someone who signs in later: only apps with a machine-wide installer are
+  installed. Microsoft Store apps and per-user-only apps (for example Discord or
+  Spotify) are skipped and listed at the end.
+
+Recommended workflow: prepare the PC with `[2]`, join the domain, and after the
+user's first sign-in run WinStation again from the admin account to add the
+remaining apps. Per-user settings such as the classic context menu belong in
+Group Policy on domain PCs.
 
 ## Driver Selection
 

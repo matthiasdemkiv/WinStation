@@ -70,6 +70,11 @@ Store IDs can change when publishers replace an app with a newer listing. If an
 app installs the wrong product, search the Microsoft Store source again before
 assuming the script is broken.
 
+Store apps are installed for the signed-in user, without administrator rights,
+through a temporary scheduled task. WinGet apps whose installer refuses
+administrator rights (for example Spotify) are retried the same way
+automatically, so no extra catalog setting is needed.
+
 ## Find The Right Package ID
 
 Use these commands in PowerShell or Windows Terminal.

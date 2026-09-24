@@ -14,6 +14,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1 redraws a progress bar for every downloaded chunk, which
+# makes web requests crawl. WinStation prints its own download progress instead.
+$ProgressPreference = 'SilentlyContinue'
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
 
 # ========================= EMBEDDED TERMINAL ART ========================
 $pixels = @(
@@ -493,6 +497,11 @@ function Test-Installed($Item) {
                 $detail = 'WinGet is unavailable. Install or update App Installer from Microsoft Store, then reopen WinStation.'
                 break
             }
+            if ($null -ne $script:userPackages) {
+                # IT admin session: check what the signed-in employee actually has.
+                $state = if ($script:userPackages.Contains("$($Item.Source)|$($Item.Id)")) { 'Installed' } else { 'Missing' }
+                break
+            }
             $previousPreference = $ErrorActionPreference
             try {
                 $ErrorActionPreference = 'Continue'
@@ -542,6 +551,13 @@ function Get-DetectionStyle($State) {
 }
 
 function Invoke-Audit {
+    $script:userPackages = $null
+    $context = Get-UserContext
+    if ($context.Separate) {
+        Write-Ui "Reading the apps installed for $($context.Interactive)..." -ForegroundColor Yellow
+        $script:userPackages = Get-UserPackageSet
+        if ($null -eq $script:userPackages) { Write-Ui "  Could not read the list for $($context.Interactive); checking as $($context.Current) instead." -ForegroundColor DarkGray }
+    }
     Write-Ui 'Scanning installed software...' -ForegroundColor Yellow
     for ($i=0; $i -lt $catalog.Count; $i++) {
         $item = $catalog[$i]
@@ -574,13 +590,17 @@ function Show-Audit {
     Write-Ui
 
     Write-Ui '[Windows 11 Actions]' -ForegroundColor Cyan
-    $menuState = if (Test-Path $classicMenuKey) { 'Enabled' } else { 'Not enabled' }
+    $context = Get-UserContext
+    $menuState = if (Test-Path (Get-ClassicMenuKey)) { 'Enabled' } else { 'Not enabled' }
     $tcpip = Get-ItemProperty 'Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
     $domainState = if ($tcpip.Domain) { $tcpip.Domain } else { 'Workgroup / not domain joined' }
     Write-Ui "  Classic full context menu: $menuState"
     Write-Ui "  Computer name: $env:COMPUTERNAME"
-    Write-Ui "  Current user: $env:USERNAME"
+    Write-Ui "  Signed-in user: $($context.Interactive)"
     Write-Ui "  Domain/workgroup: $domainState"
+    if ($context.Separate) {
+        Write-Ui "  WinStation runs as $($context.Current). Apps install for all users or for $($context.Interactive); PowerShell modules install for all users." -ForegroundColor Yellow
+    }
     Write-Ui
 }
 
@@ -604,15 +624,27 @@ function Read-ActionInput($Prompt) {
     return $answer
 }
 
+# The classic menu is a per-user setting. In an IT admin session it is written to
+# the signed-in employee's registry hive, not to the admin account.
+function Get-ClassicMenuKey {
+    $context = Get-UserContext
+    if ($context.Separate -and (Test-Path "Registry::HKEY_USERS\$($context.Sid)_Classes")) {
+        return "Registry::HKEY_USERS\$($context.Sid)_Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"
+    }
+    $classicMenuKey
+}
+
 function Enable-ClassicContextMenu {
     if (-not (Confirm-Action 'Enable the classic full Windows 11 context menu?')) {
         Write-Ui 'Action cancelled.' -ForegroundColor Yellow
         return
     }
-    if (-not $PSCmdlet.ShouldProcess('Current user', 'Enable the classic full Windows 11 context menu')) { return }
-    New-Item -Path $classicMenuKey -Force | Out-Null
-    Set-Item -Path $classicMenuKey -Value ''
-    Write-Ui 'Classic context menu enabled. Sign out or restart Windows Explorer to apply it.' -ForegroundColor Green
+    $key = Get-ClassicMenuKey
+    if (-not $PSCmdlet.ShouldProcess((Get-UserContext).Interactive, 'Enable the classic full Windows 11 context menu')) { return }
+    New-Item -Path $key -Force | Out-Null
+    Set-Item -Path $key -Value ''
+    Write-Ui "Classic context menu enabled for $((Get-UserContext).Interactive). Sign out or restart Windows Explorer to apply it." -ForegroundColor Green
+    Write-Ui 'This is a per-user setting. On domain PCs, set it for all users with Group Policy instead.' -ForegroundColor DarkGray
 }
 
 function Rename-ThisComputer {
@@ -635,7 +667,7 @@ function Rename-LocalAccountInteractive {
     $localUsers | ForEach-Object { Write-Ui "  - $($_.Name)" }
     Write-Ui
     Write-Ui 'Step 1 of 2: enter the CURRENT account name to rename.' -ForegroundColor Yellow
-    $oldName = Read-ActionInput "Current account name (signed in as: $env:USERNAME)"
+    $oldName = Read-ActionInput "Current account name (signed in as: $((Get-UserContext).Interactive))"
     if ($null -eq $oldName) { return }
     if (-not (Get-LocalUser -Name $oldName -ErrorAction SilentlyContinue)) { Write-Ui 'Local account not found.' -ForegroundColor Red; return }
     Write-Ui
@@ -676,6 +708,80 @@ function Get-DriverUpdateKind($Update) {
     'Driver'
 }
 
+function Get-UpdateErrorText([int]$HResult) {
+    $hex = '0x{0:X8}' -f $HResult
+    $hint = switch ($hex) {
+        '0x80240016' { 'Windows Update is busy with another installation. Wait for it to finish, then retry.' }
+        '0x8024001E' { 'The Windows Update service was stopping. Retry in a minute.' }
+        '0x80070422' { 'The Windows Update service is disabled.' }
+        '0x8024402C' { 'Windows Update could not reach the network.' }
+        '0x80244022' { 'The Windows Update server was busy. Retry later.' }
+        '0x80240022' { 'Windows Update reported that all selected updates failed.' }
+        '0x80070005' { 'Access denied.' }
+        default { '' }
+    }
+    if ($hint) { "$hint ($hex)" } else { "Windows Update error $hex." }
+}
+
+# A fresh Windows installation often runs its own updates in the background.
+function Wait-WindowsUpdateIdle($Installer) {
+    if (-not $Installer.IsBusy) { return $true }
+    Write-Ui 'Windows Update is busy with another installation. Waiting for it to finish (up to 15 minutes)...' -ForegroundColor Yellow
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    while ($Installer.IsBusy) {
+        if ($clock.Elapsed.TotalMinutes -ge 15) { return $false }
+        Start-Sleep -Seconds 5
+    }
+    return $true
+}
+
+# Downloads and installs one update at a time so every step is visible.
+function Install-DriverRows($Session, [object[]]$Rows) {
+    $installer = $Session.CreateUpdateInstaller()
+    $downloader = $Session.CreateUpdateDownloader()
+    for ($i = 0; $i -lt $Rows.Count; $i++) {
+        $row = $Rows[$i]
+        $row.Status = 'Not installed'; $row.Detail = ''; $row.Reboot = $false
+        Write-Ui ("`n[{0}/{1}] {2}" -f ($i + 1), $Rows.Count, $row.Name) -ForegroundColor Cyan
+        try {
+            if (-not (Wait-WindowsUpdateIdle $installer)) {
+                $row.Status = 'Failed'; $row.Detail = 'Windows Update stayed busy for 15 minutes. Retry later.'
+            } else {
+                $single = New-Object -ComObject Microsoft.Update.UpdateColl
+                [void]$single.Add($row.Update)
+                if (-not $row.Update.IsDownloaded) {
+                    Write-Ui '  Downloading...' -ForegroundColor Yellow
+                    $downloader.Updates = $single
+                    $download = $downloader.Download()
+                    if ($download.ResultCode -ne 2 -or -not $row.Update.IsDownloaded) {
+                        $row.Status = 'Download failed'; $row.Detail = Get-UpdateErrorText $download.GetUpdateResult(0).HResult
+                    }
+                }
+                if ($row.Status -ne 'Download failed') {
+                    Write-Ui '  Installing...' -ForegroundColor Yellow
+                    $installer.Updates = $single
+                    $installed = $installer.Install().GetUpdateResult(0)
+                    $row.Reboot = [bool]$installed.RebootRequired
+                    switch ([int]$installed.ResultCode) {
+                        2 { $row.Status = 'Installed'; $row.Detail = '' }
+                        3 { $row.Status = 'Installed'; $row.Detail = 'Completed with warnings.' }
+                        default { $row.Status = 'Failed'; $row.Detail = Get-UpdateErrorText $installed.HResult }
+                    }
+                }
+            }
+        } catch {
+            $problem = $_.Exception
+            if ($problem.InnerException) { $problem = $problem.InnerException }
+            $row.Status = 'Failed'
+            $row.Detail = if ($problem -is [Runtime.InteropServices.COMException]) { Get-UpdateErrorText $problem.HResult } else { $problem.Message }
+        }
+        $color = if ($row.Status -eq 'Installed') { 'Green' } else { 'Yellow' }
+        Write-Ui "  $($row.Status)" -ForegroundColor $color
+        if ($row.Detail) { Write-Ui "  $($row.Detail)" -ForegroundColor DarkGray }
+        if ($row.Reboot) { Write-Ui '  Restart required.' -ForegroundColor Yellow }
+    }
+}
+
 function Install-DriversFromWindowsUpdate {
     Show-Screen 'DRIVER UPDATES'
     if (-not (Assert-Administrator 'install drivers')) { return }
@@ -688,114 +794,96 @@ function Install-DriversFromWindowsUpdate {
         $searcher.Online = $true
         $result = $searcher.Search("IsInstalled=0 and Type='Driver'")
         if ($result.ResultCode -notin @(2,3)) { throw "Driver scan did not complete (result $($result.ResultCode))." }
-        if ($result.ResultCode -eq 3) { Write-Ui 'The driver scan completed with errors; this list may be incomplete.' -ForegroundColor Yellow }
         if ($result.Updates.Count -eq 0) { Write-Ui 'No applicable driver updates were found.' -ForegroundColor Green; return }
 
-        Write-Ui "Found $($result.Updates.Count) driver update(s):" -ForegroundColor Cyan
-        $kinds = @()
+        # Windows Update lists the same driver once per matching device. Show it once.
+        $groups = @()
         for ($i=0; $i -lt $result.Updates.Count; $i++) {
             $update = $result.Updates.Item($i)
+            $group = $groups | Where-Object Title -eq $update.Title | Select-Object -First 1
+            if (-not $group) {
+                $group = [pscustomobject]@{ Title=$update.Title; Kind='Driver'; Updates=@() }
+                $groups += $group
+            }
+            $group.Updates += $update
             $kind = Get-DriverUpdateKind $update
-            $kinds += $kind
-            $label = switch ($kind) { 'Firmware' { ' [BIOS / FIRMWARE]' }; 'Review' { ' [REVIEW: class unavailable]' }; default { '' } }
-            Write-Ui "  [$($i+1)] $($update.Title)$label"
+            if ($kind -eq 'Firmware' -or ($kind -eq 'Review' -and $group.Kind -eq 'Driver')) { $group.Kind = $kind }
         }
 
-        Write-Ui "`n[A] Select all regular drivers (excludes firmware and unclassified updates)"
-        Write-Ui '[S] Select individual drivers by number'
-        Write-Ui '[C] Cancel and return to the main menu' -ForegroundColor DarkGray
-        Write-Ui 'Type A, S, or C and press Enter.' -ForegroundColor DarkGray
-        $choice = (Read-Host 'Selection').Trim().ToUpper()
-        if ($choice -eq 'A') { $indexes = @(0..($result.Updates.Count-1) | Where-Object { $kinds[$_] -eq 'Driver' }) }
-        elseif ($choice -eq 'S') {
-            Write-Ui 'Example: 1,3,5 and then press Enter.' -ForegroundColor DarkGray
-            $numbers = @(Read-Numbers $result.Updates.Count 'Driver numbers (comma-separated)')
-            $indexes = @($numbers | ForEach-Object { $_ - 1 })
-        } else {
-            Write-Ui 'Driver installation cancelled. Nothing was downloaded or installed.' -ForegroundColor Yellow
-            return
-        }
-        if (-not $indexes.Count) { Write-Ui 'No drivers selected.' -ForegroundColor Yellow; return }
+        do {
+            $answer = ''
+            Show-Screen 'DRIVER UPDATES'
+            if ($result.ResultCode -eq 3) { Write-Ui 'The driver scan completed with errors; this list may be incomplete.' -ForegroundColor Yellow }
+            Write-Ui "Found $($groups.Count) driver update(s):" -ForegroundColor Cyan
+            for ($i=0; $i -lt $groups.Count; $i++) {
+                $label = switch ($groups[$i].Kind) { 'Firmware' { ' [BIOS / FIRMWARE]' }; 'Review' { ' [REVIEW: class unavailable]' }; default { '' } }
+                $devices = if ($groups[$i].Updates.Count -gt 1) { " (for $($groups[$i].Updates.Count) devices)" } else { '' }
+                Write-Ui "  [$($i+1)] $($groups[$i].Title)$devices$label"
+            }
 
-        Write-Ui "`nSelected driver updates:" -ForegroundColor Cyan
-        $indexes | ForEach-Object { Write-Ui "  - $($result.Updates.Item($_).Title)" }
-        if (@($indexes | Where-Object { $kinds[$_] -eq 'Firmware' }).Count) {
-            Write-Ui 'Firmware selected. Check the manufacturer instructions, connect AC power and have your BitLocker recovery key available. Do not interrupt an update or its restart.' -ForegroundColor Yellow
-            if ((Read-Host 'Type FIRMWARE and press Enter to include these updates').Trim() -cne 'FIRMWARE') {
-                Write-Ui 'Firmware confirmation cancelled. Nothing was downloaded or installed.' -ForegroundColor Yellow
+            Write-Ui "`n[A] Select all regular drivers (excludes firmware and unclassified updates)"
+            Write-Ui '[S] Select individual drivers by number'
+            Write-Ui '[C] Cancel and return to the main menu' -ForegroundColor DarkGray
+            Write-Ui 'Type A, S, or C and press Enter.' -ForegroundColor DarkGray
+            $choice = (Read-Host 'Selection').Trim().ToUpper()
+            if ($choice -eq 'A') { $chosen = @($groups | Where-Object Kind -eq 'Driver') }
+            elseif ($choice -eq 'S') {
+                Write-Ui 'Example: 1,3,5 or 1-4. Press Enter alone to go back.' -ForegroundColor DarkGray
+                $numbers = Read-Selection $groups.Count 'Driver numbers'
+                if ($null -eq $numbers) { continue }
+                $chosen = @($numbers | ForEach-Object { $groups[$_ - 1] })
+            } elseif ($choice -eq 'C') {
+                Write-Ui 'Driver installation cancelled. Nothing was downloaded or installed.' -ForegroundColor Yellow
+                return
+            } else {
+                continue
+            }
+            if (-not $chosen.Count) { Write-Ui 'No regular drivers to select. Use S to pick updates by number.' -ForegroundColor Yellow; Start-Sleep -Seconds 2; continue }
+
+            Write-Ui "`nSelected driver updates:" -ForegroundColor Cyan
+            $chosen | ForEach-Object { Write-Ui "  - $($_.Title)" }
+            if (@($chosen | Where-Object Kind -eq 'Firmware').Count) {
+                Write-Ui 'Firmware selected. Check the manufacturer instructions, connect AC power and have your BitLocker recovery key available. Do not interrupt an update or its restart.' -ForegroundColor Yellow
+                if ((Read-Host 'Type FIRMWARE and press Enter to include these updates (anything else goes back)').Trim() -cne 'FIRMWARE') { continue }
+            }
+            if (@($chosen | Where-Object Kind -eq 'Review').Count) {
+                Write-Ui 'Some selected updates have no driver class. Their titles may not identify firmware; review them before continuing.' -ForegroundColor Yellow
+            }
+            $answer = Read-PlanAnswer 'Download and install the selected driver updates?'
+            if ($answer -eq 'C') {
+                Write-Ui 'Driver installation cancelled. Nothing was downloaded or installed.' -ForegroundColor Yellow
                 return
             }
-        }
-        if (@($indexes | Where-Object { $kinds[$_] -eq 'Review' }).Count) {
-            Write-Ui 'Some selected updates have no driver class. Their titles may not identify firmware; review them before continuing.' -ForegroundColor Yellow
-        }
-        if (-not (Confirm-Action 'Download and install the selected driver updates?')) {
-            Write-Ui 'Driver installation cancelled. Nothing was downloaded or installed.' -ForegroundColor Yellow
-            return
-        }
-        if (-not $PSCmdlet.ShouldProcess('This computer', "Download and install $($indexes.Count) selected driver update(s)")) { return }
+        } while ($answer -ne 'Y')
+        $totalUpdates = ($chosen | ForEach-Object { $_.Updates.Count } | Measure-Object -Sum).Sum
+        if (-not $PSCmdlet.ShouldProcess('This computer', "Download and install $totalUpdates selected driver update(s)")) { return }
 
-        $updates = New-Object -ComObject Microsoft.Update.UpdateColl
-        foreach ($index in $indexes) {
-            $update = $result.Updates.Item($index)
-            if (-not $update.EulaAccepted) { $update.AcceptEula() }
-            [void]$updates.Add($update)
-        }
-
-        $downloader = $session.CreateUpdateDownloader()
-        $downloader.Updates = $updates
-        Write-Ui 'Downloading driver updates...' -ForegroundColor Yellow
-        $downloadResult = $downloader.Download()
-        $ready = New-Object -ComObject Microsoft.Update.UpdateColl
-        $report = @()
-        $readyRows = @()
-        for ($i=0; $i -lt $updates.Count; $i++) {
-            $update = $updates.Item($i)
-            $download = $downloadResult.GetUpdateResult($i)
-            $row = [pscustomobject]@{ Name=$update.Title; Status='Download failed'; Detail="Result $($download.ResultCode), HRESULT $($download.HResult)"; Reboot=$false }
-            $report += $row
-            if ($download.ResultCode -eq 2 -and $update.IsDownloaded) {
-                [void]$ready.Add($update)
-                $readyRows += $row
-                $row.Status = 'Not installed'
-                $row.Detail = 'Downloaded successfully.'
+        $rows = @()
+        foreach ($group in $chosen) {
+            $number = 0
+            foreach ($update in $group.Updates) {
+                $number++
+                if (-not $update.EulaAccepted) { $update.AcceptEula() }
+                $name = if ($group.Updates.Count -gt 1) { "$($group.Title) (device $number of $($group.Updates.Count))" } else { $group.Title }
+                $rows += [pscustomobject]@{ Name=$name; Update=$update; Status='Not installed'; Detail=''; Reboot=$false }
             }
         }
-        $reboot = $false
-        if ($ready.Count) {
-            $installer = $session.CreateUpdateInstaller()
-            $installer.Updates = $ready
-            Write-Ui "Installing $($ready.Count) downloaded driver update(s)..." -ForegroundColor Yellow
-            try {
-                $installResult = $installer.Install()
-                $reboot = [bool]$installResult.RebootRequired
-                for ($i=0; $i -lt $ready.Count; $i++) {
-                    $installed = $installResult.GetUpdateResult($i)
-                    $readyRows[$i].Status = switch ([int]$installed.ResultCode) {
-                        2 { 'Installed' }; 3 { 'Completed with errors' }; 5 { 'Cancelled' }; default { 'Installation failed' }
-                    }
-                    $readyRows[$i].Detail = "Result $($installed.ResultCode), HRESULT $($installed.HResult)"
-                    $readyRows[$i].Reboot = [bool]$installed.RebootRequired
-                    $reboot = $reboot -or $readyRows[$i].Reboot
-                }
-            } catch {
-                $installationError = $_.Exception.Message
-                foreach ($row in $readyRows | Where-Object Status -eq 'Not installed') {
-                    $row.Status = 'Outcome unknown'
-                    $row.Detail = $installationError
-                }
+
+        $pending = $rows
+        while ($true) {
+            Install-DriverRows $session $pending
+            Write-Ui "`n[ DRIVER RESULTS ]" -ForegroundColor Cyan
+            foreach ($row in $rows) {
+                $color = if ($row.Status -eq 'Installed') { 'Green' } else { 'Yellow' }
+                Write-Ui "  [$($row.Status)] $($row.Name)" -ForegroundColor $color
+                if ($row.Detail) { Write-Ui "    $($row.Detail)" -ForegroundColor DarkGray }
             }
+            $pending = @($rows | Where-Object Status -ne 'Installed')
+            Write-Ui "$($rows.Count - $pending.Count) installed, $($pending.Count) need attention." -ForegroundColor Cyan
+            if (-not $pending.Count) { break }
+            if ((Read-Host 'Type R and press Enter to retry the failed drivers, or press Enter to finish').Trim() -ine 'R') { break }
         }
-        Write-Ui "`n[ DRIVER RESULTS ]" -ForegroundColor Cyan
-        foreach ($row in $report) {
-            $color = if ($row.Status -eq 'Installed') { 'Green' } else { 'Yellow' }
-            Write-Ui "  [$($row.Status)] $($row.Name)" -ForegroundColor $color
-            if ($row.Status -ne 'Installed') { Write-Ui "    $($row.Detail)" -ForegroundColor DarkGray }
-            if ($row.Reboot) { Write-Ui '    Restart required.' -ForegroundColor Yellow }
-        }
-        $completed = @($report | Where-Object Status -eq 'Installed').Count
-        Write-Ui "$completed installed, $($report.Count - $completed) need attention." -ForegroundColor Cyan
-        if ($reboot) { Write-Ui 'A restart is required to finish installing drivers. WinStation will not restart automatically.' -ForegroundColor Yellow }
+        if (@($rows | Where-Object Reboot).Count) { Write-Ui 'A restart is required to finish installing drivers. WinStation will not restart automatically.' -ForegroundColor Yellow }
     } catch {
         Write-Ui "Driver installation failed: $($_.Exception.Message)" -ForegroundColor Red
     }
@@ -835,13 +923,53 @@ function Show-WindowsActions {
     } while ($true)
 }
 
-function Read-Numbers($Maximum, $Prompt) {
-    $result = @()
-    foreach ($token in ((Read-Host $Prompt) -split ',')) {
-        $number = 0
-        if ([int]::TryParse($token.Trim(), [ref]$number) -and $number -ge 1 -and $number -le $Maximum) { $result += $number }
+# Returns the chosen numbers (1..Maximum), or $null when the user goes back.
+# Accepts lists and ranges such as 1,3,5-7 and asks again after a typo.
+function Read-Selection($Maximum, $Prompt) {
+    while ($true) {
+        $raw = (Read-Host "$Prompt (Enter or B = back)").Trim()
+        if (-not $raw -or $raw -ieq 'B') { return $null }
+        $numbers = @()
+        $invalid = @()
+        foreach ($token in ($raw -split '[,;\s]+' | Where-Object { $_ })) {
+            if ($token -match '^(\d+)-(\d+)$' -and [int]$Matches[1] -ge 1 -and [int]$Matches[2] -le $Maximum -and [int]$Matches[1] -le [int]$Matches[2]) {
+                $numbers += [int]$Matches[1]..[int]$Matches[2]
+            } elseif ($token -match '^\d+$' -and [int]$token -ge 1 -and [int]$token -le $Maximum) {
+                $numbers += [int]$token
+            } else { $invalid += $token }
+        }
+        if ($invalid.Count) { Write-Ui "Not valid: $($invalid -join ', '). Use numbers from 1 to $Maximum." -ForegroundColor Yellow; continue }
+        if (-not $numbers.Count) { continue }
+        return ,@($numbers | Select-Object -Unique)
     }
-    @($result | Select-Object -Unique)
+}
+
+# Returns Y (start), B (back to the selection) or C (cancel).
+function Read-PlanAnswer($Message) {
+    Write-Ui $Message -ForegroundColor Yellow
+    Write-Ui '[Y] Yes, start   [B] Back and change the selection   [C] Cancel' -ForegroundColor DarkGray
+    while ($true) {
+        $answer = (Read-Host 'Type Y, B, or C and press Enter').Trim().ToUpper()
+        if ($answer -in @('Y','B','C')) { return $answer }
+    }
+}
+
+# Some apps (Store apps, Discord, Spotify...) install for one account only.
+# Returns 1 (the signed-in account) or 2 (someone who signs in later).
+function Read-InstallTarget($Context) {
+    Show-Screen 'WHO IS THIS FOR?'
+    $name = ($Context.Interactive -split '\\')[-1]
+    Write-Ui 'Some apps install for one account only (for example Microsoft Store apps, Discord, Spotify).' -ForegroundColor Cyan
+    Write-Ui
+    Write-Ui "[1] For $name - the account signed in now"
+    Write-Ui '    Everything installs; per-user apps go to this account.' -ForegroundColor DarkGray
+    Write-Ui '[2] For someone who signs in later - I am preparing this PC'
+    Write-Ui '    Only apps for all users install. Per-user apps are skipped and listed at the end;' -ForegroundColor DarkGray
+    Write-Ui '    run WinStation again after that person signs in.' -ForegroundColor DarkGray
+    while ($true) {
+        $answer = (Read-Host 'Type 1 or 2 and press Enter').Trim()
+        if ($answer -in @('1','2')) { return $answer }
+    }
 }
 
 function Select-InstallItems {
@@ -853,27 +981,49 @@ function Select-InstallItems {
         @{ Text='[3]  Select individual items'; Color='White' },
         @{ Text='[B]  Back to the main menu'; Color='DarkGray' }
     )
-    $choice = Show-ChoiceMenu -Title 'SOFTWARE INSTALLATION' -MenuLines $menuLines -ExitKey 'B' -ExitHint 'Esc: back | B: select back' -ShortcutHint '1-3: select a shortcut, then press Enter.' -EscapeToExit
-    if ($choice -eq 'B') { return @() }
-    if ($choice -eq '1') { return $missing }
-    if ($choice -eq '2') {
-        $categories = @($missing.Category | Sort-Object -Unique)
-        for ($i=0; $i -lt $categories.Count; $i++) {
-            $count = @($missing | Where-Object Category -eq $categories[$i]).Count
-            Write-Ui "[$($i+1)] $($categories[$i]) ($count missing)"
+    $showAudit = $false
+    while ($true) {
+        if ($showAudit) { Show-Banner -Still; Show-Audit }
+        $showAudit = $true
+        $choice = Show-ChoiceMenu -Title 'SOFTWARE INSTALLATION' -MenuLines $menuLines -ExitKey 'B' -ExitHint 'Esc: back | B: select back' -ShortcutHint '1-3: select a shortcut, then press Enter.' -EscapeToExit
+        $picked = $null
+        switch ($choice) {
+            'B' { return @() }
+            '1' { $picked = $missing }
+            '2' {
+                Show-Screen 'SELECT CATEGORIES'
+                $categories = @($missing.Category | Sort-Object -Unique)
+                for ($i=0; $i -lt $categories.Count; $i++) {
+                    $count = @($missing | Where-Object Category -eq $categories[$i]).Count
+                    Write-Ui "[$($i+1)] $($categories[$i]) ($count missing)"
+                }
+                Write-Ui 'Example: 1,3 or 2-4 and then press Enter.' -ForegroundColor DarkGray
+                $numbers = Read-Selection $categories.Count 'Category numbers'
+                if ($null -ne $numbers) {
+                    $chosen = @($numbers | ForEach-Object { $categories[$_-1] })
+                    $picked = @($missing | Where-Object { $_.Category -in $chosen })
+                }
+            }
+            '3' {
+                Show-Screen 'SELECT ITEMS'
+                for ($i=0; $i -lt $missing.Count; $i++) { Write-Ui "[$($i+1)] $($missing[$i].Category) / $($missing[$i].Name)" }
+                Write-Ui 'Example: 1,4,7 or 2-5 and then press Enter.' -ForegroundColor DarkGray
+                $numbers = Read-Selection $missing.Count 'Item numbers'
+                if ($null -ne $numbers) { $picked = @($numbers | ForEach-Object { $missing[$_-1] }) }
+            }
         }
-        Write-Ui 'Example: 1,3 and then press Enter.' -ForegroundColor DarkGray
-        $numbers = Read-Numbers $categories.Count 'Category numbers (comma-separated)'
-        $chosen = @($numbers | ForEach-Object { $categories[$_-1] })
-        return @($missing | Where-Object { $_.Category -in $chosen })
+        if (-not $picked) { continue }
+
+        Show-Screen 'INSTALLATION PLAN'
+        $plan = @(Resolve-InstallDependencies $picked)
+        Write-Ui "Selected $($plan.Count) item(s):" -ForegroundColor Cyan
+        $plan | ForEach-Object { Write-Ui "  - $($_.Name)" }
+        Write-Ui
+        switch (Read-PlanAnswer 'Install the selected software?') {
+            'Y' { return $plan }
+            'C' { Write-Ui 'Installation cancelled.' -ForegroundColor Yellow; return @() }
+        }
     }
-    if ($choice -eq '3') {
-        for ($i=0; $i -lt $missing.Count; $i++) { Write-Ui "[$($i+1)] $($missing[$i].Category) / $($missing[$i].Name)" }
-        Write-Ui 'Example: 1,4,7 and then press Enter.' -ForegroundColor DarkGray
-        $numbers = Read-Numbers $missing.Count 'Item numbers (comma-separated)'
-        return @($numbers | ForEach-Object { $missing[$_-1] })
-    }
-    @()
 }
 
 function New-InstallResult($Item, $Status, $Detail='', $Code=0, [bool]$Reboot=$false) {
@@ -881,46 +1031,96 @@ function New-InstallResult($Item, $Status, $Detail='', $Code=0, [bool]$Reboot=$f
 }
 
 function ConvertTo-ProcessArgument([string]$Value) {
+    # Quote only when needed: msiexec rejects quoted switches such as "/i" (exit 1639).
+    if ($Value -and $Value -notmatch '[\s"]') { return $Value }
     # Windows native argument quoting: preserve embedded quotes and trailing slashes.
     '"' + ([regex]::Replace($Value, '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1') + '"'
 }
 
 function Invoke-SetupProcess([string]$FilePath, [string[]]$Arguments) {
     $argumentLine = ($Arguments | ForEach-Object { ConvertTo-ProcessArgument $_ }) -join ' '
-    $clock = [Diagnostics.Stopwatch]::StartNew()
     $process = $null
     try {
         # Keep native download/installer output visible in the current terminal.
         $process = Start-Process -FilePath $FilePath -ArgumentList $argumentLine -NoNewWindow -PassThru -ErrorAction Stop
         # Windows PowerShell 5.1 needs an open handle to retain the exit code.
         $null = $process.Handle
-        $nextNotice = 15
-        while (-not $process.WaitForExit(1000)) {
-            if ($clock.Elapsed.TotalSeconds -ge $nextNotice) {
-                Write-Ui ('  Still working - elapsed {0:mm\:ss}.' -f $clock.Elapsed) -ForegroundColor DarkGray
-                $nextNotice += 15
-            }
-        }
         $process.WaitForExit()
         if ($null -eq $process.ExitCode) { throw 'The installer exited without a readable exit code. Check its result before retrying.' }
         return [int]$process.ExitCode
     } finally {
         if ($null -ne $process) { $process.Dispose() }
-        $clock.Stop()
     }
+}
+
+function Format-Megabytes([long]$Bytes) { '{0:N1} MB' -f ($Bytes / 1MB) }
+
+# Streams a download to disk with a single-line progress indicator.
+function Save-Download([string]$Url, [string]$Path) {
+    $request = [Net.HttpWebRequest]::Create($Url)
+    $request.UserAgent = 'WinStation'
+    $request.Timeout = 60000
+    $request.ReadWriteTimeout = 120000
+    $response = $request.GetResponse()
+    $source = $null
+    $target = $null
+    try {
+        $total = $response.ContentLength
+        $source = $response.GetResponseStream()
+        $target = [IO.File]::Create($Path)
+        $buffer = New-Object byte[] (1MB)
+        $done = 0L
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $nextUpdate = 0
+        while (($read = $source.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $target.Write($buffer, 0, $read)
+            $done += $read
+            if ($clock.ElapsedMilliseconds -ge $nextUpdate) {
+                $speed = $done / [Math]::Max(0.001, $clock.Elapsed.TotalSeconds)
+                $progress = if ($total -gt 0) { '{0} / {1} ({2:N0}%)' -f (Format-Megabytes $done), (Format-Megabytes $total), ($done * 100 / $total) } else { Format-Megabytes $done }
+                Write-Ui ("`r  Downloaded {0}  {1}/s    " -f $progress, (Format-Megabytes $speed)) -ForegroundColor DarkGray -NoNewline
+                $nextUpdate += 500
+            }
+        }
+        Write-Ui ("`r  Downloaded {0}.                              " -f (Format-Megabytes $done)) -ForegroundColor DarkGray
+        if ($total -gt 0 -and $done -ne $total) { throw "Download incomplete: $done of $total bytes." }
+    } finally {
+        if ($target) { $target.Dispose() }
+        if ($source) { $source.Dispose() }
+        $response.Dispose()
+    }
+}
+
+function Get-MsiErrorText([int]$Code, [string]$LogPath) {
+    $hint = switch ($Code) {
+        1602 { 'The installation was cancelled.' }
+        1603 { 'The installer hit a fatal error.' }
+        1618 { 'Another installation was still running. Wait for it to finish, then retry.' }
+        1619 { 'The downloaded MSI could not be opened.' }
+        1639 { 'msiexec rejected the command line.' }
+        default { '' }
+    }
+    "MSI exit code $code. $hint Log: $LogPath".Replace('  ', ' ')
 }
 
 function Install-Msi($Item, $Url, [string[]]$Properties=@()) {
     if (-not $PSCmdlet.ShouldProcess($Item.Name, "Download and install official MSI from $Url")) {
         return (New-InstallResult $Item 'Skipped' 'Installation was not approved.')
     }
-    $path = Join-Path ([IO.Path]::GetTempPath()) "workstation-$([guid]::NewGuid()).msi"
+    $path = Join-Path ([IO.Path]::GetTempPath()) "winstation-$([guid]::NewGuid().ToString('N')).msi"
+    $logPath = Join-Path ([IO.Path]::GetTempPath()) ("WinStation-{0}.log" -f ($Item.Name -replace '[^A-Za-z0-9]+', '-'))
     try {
         Write-Ui "Downloading $($Item.Name)..." -ForegroundColor Yellow
-        Invoke-WebRequest -Uri $Url -OutFile $path -UseBasicParsing -ErrorAction Stop
-        Write-Ui "Installing $($Item.Name)..." -ForegroundColor Yellow
-        $code = Invoke-SetupProcess 'msiexec.exe' (@('/i',$path,'/qn','/norestart')+$Properties)
-        if ($code -notin @(0,1641,3010)) { return (New-InstallResult $Item 'Failed' "MSI exit code $code." $code) }
+        Save-Download $Url $path
+        # A fresh Windows installation may still be running Windows Update or Store installs.
+        for ($attempt = 1; $attempt -le 10; $attempt++) {
+            Write-Ui "Installing $($Item.Name)..." -ForegroundColor Yellow
+            $code = Invoke-SetupProcess 'msiexec.exe' (@('/i',$path,'/qn','/norestart','/L*V',$logPath)+$Properties)
+            if ($code -ne 1618) { break }
+            Write-Ui '  Another installation is running. Retrying in 30 seconds...' -ForegroundColor DarkGray
+            Start-Sleep -Seconds 30
+        }
+        if ($code -notin @(0,1641,3010)) { return (New-InstallResult $Item 'Failed' (Get-MsiErrorText $code $logPath) $code) }
         return (New-InstallResult $Item 'Installed' '' $code ($code -in @(1641,3010)))
     } catch { return (New-InstallResult $Item 'Failed' $_.Exception.Message 'MSI') }
     finally {
@@ -928,22 +1128,196 @@ function Install-Msi($Item, $Url, [string[]]$Properties=@()) {
     }
 }
 
+# The account signed in to this desktop, which may differ from the elevated one.
+function Get-InteractiveUser {
+    try {
+        $sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+        foreach ($explorer in @(Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop)) {
+            if ($explorer.SessionId -ne $sessionId) { continue }
+            $owner = Invoke-CimMethod -InputObject $explorer -MethodName GetOwner -ErrorAction Stop
+            if ($owner.ReturnValue -eq 0 -and $owner.User) { return "$($owner.Domain)\$($owner.User)" }
+        }
+    } catch {}
+    try { return (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName } catch {}
+    $null
+}
+
+# Separate is true when an IT admin account elevated WinStation for a signed-in
+# employee. Per-user results must then land in the employee's profile.
+function Get-UserContext {
+    if ($script:userContext) { return $script:userContext }
+    $current = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $interactive = Get-InteractiveUser
+    $sid = $null
+    if ($interactive) {
+        try { $sid = ([Security.Principal.NTAccount]$interactive).Translate([Security.Principal.SecurityIdentifier]).Value } catch {}
+    }
+    $script:userContext = [pscustomobject]@{
+        Interactive = if ($interactive) { $interactive } else { $current.Name }
+        Current = $current.Name
+        Sid = $sid
+        Separate = [bool]($interactive -and $sid -and $sid -ne $current.User.Value)
+    }
+    $script:userContext
+}
+
+# Prints complete new lines of a log another process is still writing.
+function Write-NewLogLines([string]$Path, [int]$Printed) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $Printed }
+    try {
+        $stream = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        try { $text = (New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8)).ReadToEnd() } finally { $stream.Dispose() }
+    } catch { return $Printed }
+    $lines = $text -split "`n"
+    for ($i = $Printed; $i -lt $lines.Count - 1; $i++) {
+        # Keep the final state of carriage-return progress lines; hide spinners and bars.
+        $line = ($lines[$i].TrimEnd("`r") -split "`r")[-1]
+        $line = (ConvertTo-SafeText $line -StripAnsi).Trim()
+        if ($line -and $line -notmatch '^[-\\|/ ]*$' -and $line -notmatch "[$([char]0x2580)-$([char]0x259F)]") { Write-Ui "  $line" -ForegroundColor DarkGray }
+    }
+    [Math]::Max($Printed, $lines.Count - 1)
+}
+
+# Runs winget as the signed-in user without administrator rights, through a
+# temporary scheduled task. %OUT% in the arguments names a file returned as Output.
+# Returns @{ Code; Output }, or $null when no signed-in user can be found.
+function Invoke-WinGetAsUser([string]$WinGetArguments, [switch]$Quiet) {
+    $user = Get-InteractiveUser
+    if (-not $user) { return $null }
+    $runDir = Join-Path $env:ProgramData "WinStation\run-$([guid]::NewGuid().ToString('N'))"
+    $taskName = "WinStation-$([guid]::NewGuid().ToString('N'))"
+    $registered = $false
+    try {
+        New-Item -ItemType Directory -Path $runDir -Force | Out-Null
+        & icacls.exe $runDir /grant "${user}:(OI)(CI)M" | Out-Null
+        $logPath = Join-Path $runDir 'output.log'
+        $exitPath = Join-Path $runDir 'exit.txt'
+        $outPath = Join-Path $runDir 'result.out'
+        @(
+            '@echo off'
+            'set "WINGET=%LOCALAPPDATA%\Microsoft\WindowsApps\winget.exe"'
+            'if not exist "%WINGET%" set "WINGET=winget.exe"'
+            """%WINGET%"" $($WinGetArguments.Replace('%OUT%', '"%~dp0result.out"')) > ""%~dp0output.log"" 2>&1"
+            '>"%~dp0exit.txt" echo %ERRORLEVEL%'
+        ) -join "`r`n" | Set-Content -LiteralPath (Join-Path $runDir 'run.cmd') -Encoding ASCII
+        # conhost --headless keeps the helper console hidden on the user's desktop.
+        $action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\conhost.exe') -Argument ('--headless "{0}" /d /c ""{1}""' -f (Join-Path $env:SystemRoot 'System32\cmd.exe'), (Join-Path $runDir 'run.cmd'))
+        $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+        Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+        $registered = $true
+        Start-ScheduledTask -TaskName $taskName
+
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $printed = 0
+        while (-not (Test-Path -LiteralPath $exitPath)) {
+            Start-Sleep -Milliseconds 700
+            if (-not $Quiet) { $printed = Write-NewLogLines $logPath $printed }
+            if ($clock.Elapsed.TotalSeconds -gt 15 -and (Get-ScheduledTask -TaskName $taskName).State -ne 'Running' -and -not (Test-Path -LiteralPath $exitPath)) {
+                throw "WinGet did not start for $user (task result $((Get-ScheduledTaskInfo -TaskName $taskName).LastTaskResult))."
+            }
+            if ($clock.Elapsed.TotalMinutes -ge 60) { throw 'WinGet did not finish within 60 minutes.' }
+        }
+        Start-Sleep -Milliseconds 300
+        if (-not $Quiet) { [void](Write-NewLogLines $logPath $printed) }
+        $output = if (Test-Path -LiteralPath $outPath) { Get-Content -LiteralPath $outPath -Raw } else { $null }
+        return [pscustomobject]@{ Code = [int]((Get-Content -LiteralPath $exitPath -Raw).Trim()); Output = $output }
+    } finally {
+        if ($registered) {
+            try { Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } catch {}
+            try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+        }
+        Remove-Item -LiteralPath $runDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Package IDs the signed-in user has (per-user and machine-wide), as "source|id".
+# Returns $null when the list cannot be read.
+function Get-UserPackageSet {
+    try {
+        $run = Invoke-WinGetAsUser 'export -o %OUT% --accept-source-agreements --disable-interactivity' -Quiet
+        if ($null -eq $run -or -not $run.Output) { return $null }
+        $set = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($source in (ConvertFrom-Json $run.Output).Sources) {
+            foreach ($package in $source.Packages) { [void]$set.Add("$($source.SourceDetails.Name)|$($package.PackageIdentifier)") }
+        }
+        return ,$set
+    } catch { return $null }
+}
+
+function Install-WinGetItem($Item) {
+    $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if (-not $winget) { return (New-InstallResult $Item 'Failed' 'WinGet is unavailable. Install or update App Installer from Microsoft Store, then scan again.' 'WINGET') }
+    if ($Item.Id -notmatch '^[A-Za-z0-9._+-]+$' -or $Item.Source -notmatch '^[A-Za-z0-9._-]+$') { return (New-InstallResult $Item 'Failed' "Unsupported package ID: $($Item.Id)") }
+    $context = Get-UserContext
+    $baseArguments = @('install','--id',$Item.Id,'--exact','--source',$Item.Source,'--silent','--accept-package-agreements','--accept-source-agreements','--disable-interactivity')
+    $noScopeMatch = -1978335216        # 0x8A150010: no installer matches the requested scope
+    $prohibitsElevation = -1978335146  # 0x8A150056: installer must not run as administrator
+    $asUser = {
+        param([string[]]$Extra)
+        $run = Invoke-WinGetAsUser ((@($baseArguments) + $Extra) -join ' ')
+        if ($null -ne $run) { $run.Code }
+    }
+    $code = $null
+    $perUserSkip = 'Installs for one account only. Run WinStation again after the user signs in.'
+    if ($script:deviceMode) {
+        # Preparing the PC for someone who signs in later: only machine-wide installs,
+        # so nothing lands in the admin profile.
+        if ($Item.Source -eq 'msstore') { return (New-InstallResult $Item 'Skipped' $perUserSkip) }
+        Write-Ui "Installing $($Item.Name) for all users..." -ForegroundColor Yellow
+        $code = Invoke-SetupProcess $winget.Source ($baseArguments + @('--scope','machine'))
+        if ($code -in @($noScopeMatch, $prohibitsElevation)) { return (New-InstallResult $Item 'Skipped' $perUserSkip) }
+    } elseif ($Item.Source -eq 'msstore') {
+        # Store apps always belong to the signed-in user.
+        Write-Ui "Installing $($Item.Name) from Microsoft Store for $($context.Interactive)..." -ForegroundColor Yellow
+        $code = & $asUser @()
+        if ($null -eq $code) { Write-Ui '  No signed-in user found; installing as administrator instead.' -ForegroundColor DarkGray }
+    } elseif ($context.Separate) {
+        # IT admin session: prefer a machine-wide install so every user gets the app.
+        # Per-user-only apps go to the signed-in employee, never to the admin profile.
+        Write-Ui "Installing $($Item.Name) for all users..." -ForegroundColor Yellow
+        $code = Invoke-SetupProcess $winget.Source ($baseArguments + @('--scope','machine'))
+        if ($code -eq $noScopeMatch) {
+            Write-Ui "No machine-wide installer. Installing $($Item.Name) for $($context.Interactive)..." -ForegroundColor Yellow
+            $code = & $asUser @('--scope','user')
+            if ($code -eq $noScopeMatch) {
+                # The installer declares no scope; such setups are usually machine-wide.
+                Write-Ui "Installing $($Item.Name) with its default installer..." -ForegroundColor Yellow
+                $code = Invoke-SetupProcess $winget.Source $baseArguments
+            }
+        }
+        if ($code -eq $prohibitsElevation) {
+            Write-Ui "This installer must run without administrator rights. Installing for $($context.Interactive)..." -ForegroundColor Yellow
+            $code = & $asUser @()
+        }
+    }
+    if ($null -eq $code) {
+        Write-Ui "Installing $($Item.Name)..." -ForegroundColor Yellow
+        $code = Invoke-SetupProcess $winget.Source $baseArguments
+        if ($code -eq $prohibitsElevation) {
+            Write-Ui 'This installer must run without administrator rights. Retrying as the signed-in user...' -ForegroundColor Yellow
+            $userCode = & $asUser @()
+            if ($null -ne $userCode) { $code = $userCode }
+        }
+    }
+    if ($code -eq 0) { return (New-InstallResult $Item 'Installed') }
+    if ($code -in @(-1978334967,-1978334965)) { return (New-InstallResult $Item 'Installed' 'The installer reported a restart.' $code $true) }
+    if ($code -eq -1978334966) { return (New-InstallResult $Item 'Failed' 'Restart Windows before retrying this installation.' $code $true) }
+    if ($code -eq -1978335189) { return (New-InstallResult $Item 'Already installed' 'No applicable update.') }
+    $hint = switch ($code) {
+        -2147023665 { 'Microsoft Store could not be reached. Open Microsoft Store once, let it finish updating, then retry.' }
+        -1978335146 { 'The installer refuses to run as administrator and no signed-in user was found.' }
+        -1978335212 { 'The package was not found in its source.' }
+        default { 'See the installer output above.' }
+    }
+    return (New-InstallResult $Item 'Failed' ('WinGet exit code {0} (0x{1:X8}). {2}' -f $code, $code, $hint) $code)
+}
+
 function Install-One($Item) {
     try {
     if ($Item.Type -eq 'WinGet') {
         if (-not $PSCmdlet.ShouldProcess($Item.Name, 'Install with WinGet')) { return (New-InstallResult $Item 'Skipped') }
-        $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
-        if (-not $winget) { return (New-InstallResult $Item 'Failed' 'WinGet is unavailable. Install or update App Installer from Microsoft Store, then scan again.' 'WINGET') }
-        Write-Ui "Installing $($Item.Name)..." -ForegroundColor Yellow
-        $code = Invoke-SetupProcess $winget.Source @('install','--id',$Item.Id,'--exact','--source',$Item.Source,'--silent','--accept-package-agreements','--accept-source-agreements','--disable-interactivity')
-        if ($code -eq 0) { return (New-InstallResult $Item 'Installed') }
-        if ($code -in @(-1978334967,-1978334965)) { return (New-InstallResult $Item 'Installed' 'The installer reported a restart.' $code $true) }
-        if ($code -eq -1978334966) { return (New-InstallResult $Item 'Failed' 'Restart Windows before retrying this installation.' $code $true) }
-        if ($code -eq -1978335189) {
-            $detection = Test-Installed $Item
-            if ($detection.State -eq 'Installed') { return (New-InstallResult $Item 'Already installed' 'No applicable update.') }
-        }
-        return (New-InstallResult $Item 'Failed' "WinGet exit code $code. See the installer output above and WinGet diagnostic logs." $code)
+        return (Install-WinGetItem $Item)
     }
     if ($Item.Type -eq 'AzureCLI') { Install-Msi $Item 'https://aka.ms/installazurecliwindowsx64'; return }
     if ($Item.Type -eq 'PowerShell') {
@@ -962,7 +1336,9 @@ function Install-One($Item) {
         if (-not (Test-Path $pwshPath)) { return (New-InstallResult $Item 'Failed' 'PowerShell 7 is not available. Its installation may have failed or may require a restart.' 'PWSH') }
         Write-Ui "Installing $($Item.Name)..." -ForegroundColor Yellow
         $id = $Item.Id.Replace("'", "''")
-        $command = "try { `$ErrorActionPreference='Stop'; Install-Module '$id' -Scope CurrentUser -Repository PSGallery -Force -AllowClobber -Confirm:`$false -ErrorAction Stop; if(-not (Get-Module -ListAvailable '$id' -ErrorAction Stop)){throw 'Module not found after installation.'}; exit 0 } catch { Write-Host `$_.Exception.Message -ForegroundColor Red; exit 1 }"
+        # AllUsers makes the modules available to both the employee and the admin account.
+        $moduleScope = if (Test-IsAdministrator) { 'AllUsers' } else { 'CurrentUser' }
+        $command = "try { `$ErrorActionPreference='Stop'; `$ProgressPreference='SilentlyContinue'; Install-Module '$id' -Scope $moduleScope -Repository PSGallery -Force -AllowClobber -Confirm:`$false -ErrorAction Stop; if(-not (Get-Module -ListAvailable '$id' -ErrorAction Stop)){throw 'Module not found after installation.'}; exit 0 } catch { Write-Host `$_.Exception.Message -ForegroundColor Red; exit 1 }"
         $code = Invoke-SetupProcess $pwshPath @('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',(ConvertTo-EncodedCommand $command))
         if ($code -eq 0) { return (New-InstallResult $Item 'Installed') }
         return (New-InstallResult $Item 'Failed' "Module installation failed (exit $code). See the error above." $code)
@@ -993,40 +1369,54 @@ function Invoke-SoftwareWorkflow([switch]$All) {
         Write-Ui 'No missing software was found.' -ForegroundColor Green
         return $true
     }
-    $selected = if ($All) { $missing } else { @(Select-InstallItems) }
+    if ($All) {
+        $selected = @(Resolve-InstallDependencies $missing)
+        Write-Ui "`nSelected $($selected.Count) item(s):" -ForegroundColor Cyan
+        $selected | ForEach-Object { Write-Ui "  - $($_.Name)" }
+    } else {
+        $selected = @(Select-InstallItems)
+    }
     if (-not $selected.Count) { return $false }
-    $selected = @(Resolve-InstallDependencies $selected)
-    Write-Ui "`nSelected $($selected.Count) item(s):" -ForegroundColor Cyan
-    $selected | ForEach-Object { Write-Ui "  - $($_.Name)" }
-    if (-not $All -and -not (Confirm-Action 'Install the selected software?')) {
-        Write-Ui 'Installation cancelled.' -ForegroundColor Yellow
-        return $false
+    $script:deviceMode = $false
+    $context = Get-UserContext
+    if (-not $All -and -not $context.Separate -and @($selected | Where-Object Type -eq 'WinGet').Count) {
+        $script:deviceMode = (Read-InstallTarget $context) -eq '2'
     }
     $successStatuses = @('Installed','Already installed')
     $results = @()
-    $position = 0
-    foreach ($item in $selected) {
-        $position++
-        Write-Ui "`n[$position/$($selected.Count)] $($item.Name)" -ForegroundColor Cyan
-        try { $result = Install-One $item }
-        catch { $result = New-InstallResult $item 'Failed' $_.Exception.Message }
-        if ($null -eq $result) { $result = New-InstallResult $item 'Failed' 'Installer returned no result.' }
-        $results += $result
-        $color = if ($result.Status -in $successStatuses) { 'Green' } else { 'Yellow' }
-        Write-Ui "  $($result.Status)" -ForegroundColor $color
-        if ($result.Detail) { Write-Ui "  $($result.Detail)" -ForegroundColor DarkGray }
+    while ($true) {
+        $position = 0
+        foreach ($item in $selected) {
+            $position++
+            Write-Ui "`n[$position/$($selected.Count)] $($item.Name)" -ForegroundColor Cyan
+            try { $result = Install-One $item }
+            catch { $result = New-InstallResult $item 'Failed' $_.Exception.Message }
+            if ($null -eq $result) { $result = New-InstallResult $item 'Failed' 'Installer returned no result.' }
+            # A retry replaces the earlier result for the same item.
+            $results = @($results | Where-Object { $_.Item -ne $item }) + $result
+            $color = if ($result.Status -in $successStatuses) { 'Green' } else { 'Yellow' }
+            Write-Ui "  $($result.Status)" -ForegroundColor $color
+            if ($result.Detail) { Write-Ui "  $($result.Detail)" -ForegroundColor DarkGray }
+        }
+        Write-Ui "`n[ SOFTWARE RESULTS ]" -ForegroundColor Cyan
+        foreach ($result in $results) {
+            $color = if ($result.Status -in $successStatuses) { 'Green' } else { 'Yellow' }
+            Write-Ui "  [$($result.Status)] $($result.Name)" -ForegroundColor $color
+            if ($result.Detail) { Write-Ui "    $($result.Detail)" -ForegroundColor DarkGray }
+            if ($result.Reboot) { Write-Ui '    Restart required.' -ForegroundColor Yellow }
+        }
+        $completed = @($results | Where-Object { $_.Status -in $successStatuses }).Count
+        $failedItems = @($results | Where-Object Status -eq 'Failed' | ForEach-Object Item)
+        $skipped = @($results | Where-Object Status -eq 'Skipped').Count
+        Write-Ui "$completed completed, $($failedItems.Count) failed, $skipped skipped." -ForegroundColor Cyan
+        if ($All -or -not $failedItems.Count) { break }
+        if ((Read-Host 'Type R and press Enter to retry the failed items, or press Enter to finish').Trim() -ine 'R') { break }
+        $selected = @(Resolve-InstallDependencies $failedItems)
     }
-    Write-Ui "`n[ SOFTWARE RESULTS ]" -ForegroundColor Cyan
-    foreach ($result in $results) {
-        $color = if ($result.Status -in $successStatuses) { 'Green' } else { 'Yellow' }
-        Write-Ui "  [$($result.Status)] $($result.Name)" -ForegroundColor $color
-        if ($result.Detail) { Write-Ui "    $($result.Detail)" -ForegroundColor DarkGray }
-        if ($result.Reboot) { Write-Ui '    Restart required.' -ForegroundColor Yellow }
+    $postponed = @($results | Where-Object { $_.Status -eq 'Skipped' -and $_.Detail -like 'Installs for one account only*' })
+    if ($postponed.Count) {
+        Write-Ui "`nAfter the user signs in, run WinStation again to install: $(($postponed.Name) -join ', ')." -ForegroundColor Yellow
     }
-    $completed = @($results | Where-Object { $_.Status -in $successStatuses }).Count
-    $failed = @($results | Where-Object Status -eq 'Failed').Count
-    $skipped = @($results | Where-Object Status -eq 'Skipped').Count
-    Write-Ui "$completed completed, $failed failed, $skipped skipped." -ForegroundColor Cyan
     if (@($results | Where-Object Reboot).Count) { Write-Ui 'A restart is required. WinStation will not restart automatically.' -ForegroundColor Yellow }
     Write-Ui 'Restart the terminal before using newly installed command-line tools.' -ForegroundColor DarkGray
     return $true
